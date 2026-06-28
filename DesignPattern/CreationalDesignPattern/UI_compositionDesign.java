@@ -81,6 +81,8 @@ class Header implements UIComponent {
     }
 }
 
+
+
 class Sidebar implements UIComponent {
 
     private List<MenuItem> menuItems = new ArrayList<>();
@@ -101,7 +103,6 @@ class Sidebar implements UIComponent {
 }
 
 class Content implements UIComponent {
-
     private WelcomeCard welcomeCard = new WelcomeCard();
     private RevenueChart revenueChart = new RevenueChart();
     private OrdersTable ordersTable = new OrdersTable();
@@ -142,6 +143,11 @@ class Dashboard implements UIComponent {
         System.out.println("\n=======================\n");
     }
 }
+
+class DashboardV2 extends Dashboard{
+
+}
+
 
 // ----------------------
 // Driver
