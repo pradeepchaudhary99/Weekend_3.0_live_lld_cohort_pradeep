@@ -1,0 +1,2 @@
+class ObserverDesignPattern:
+    pass

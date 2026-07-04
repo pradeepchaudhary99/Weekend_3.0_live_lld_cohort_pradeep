@@ -1,0 +1,2 @@
+class StateDesignPattern:
+    pass
