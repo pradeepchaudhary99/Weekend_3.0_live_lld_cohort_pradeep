@@ -1,4 +1,4 @@
-package DesignPattern.CreationalDesignPattern;
+package CreationalDesignPattern;
 
 
 //Products in UI

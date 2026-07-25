@@ -1,4 +1,4 @@
-package DesignPattern.CreationalDesignPattern;
+package CreationalDesignPattern;
 
 //Product 
 interface INotification{

@@ -1,5 +1,5 @@
 
-package DesignPattern.CreationalDesignPattern;
+package CreationalDesignPattern;
 
 
 class Student{

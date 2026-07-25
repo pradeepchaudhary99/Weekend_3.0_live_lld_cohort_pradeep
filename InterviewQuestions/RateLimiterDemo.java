@@ -1,92 +1,205 @@
-import java.security.Timestamp;
-import java.time.LocalDateTime;
-import java.util.Deque;
-import java.util.LinkedList;
-import java.util.Map;
+/*
+Rate Limiter
+------------------------------
 
-interface RateLimiter{
+Functional Requirements:
+    System should limit the number of requests a user can make in a given time
+    Support multiple algorithms: Token Bucket, Sliding Window
+    Rate limiting should be applied per user (per key)
+    Easy to add new algorithms
+
+Non-Functional Requirements:
+    Thread-safe: many threads can call isAllowed() for the same/different users concurrently
+    Low latency: no global lock across all users
+    Extensible: new strategies pluggable via the RateLimiter interface (Strategy pattern)
+
+Entities:
+    RateLimiter (Strategy interface)
+    TokenBucket / TokenBucketRateLimiter
+    SlidingWindow / SlidingWindowRateLimiter
+    RateLimiterFactory
+*/
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// ---------- Strategy interface ----------
+
+interface RateLimiter {
     boolean isAllowed(String userId);
 }
 
-class TokenBucketRateLimitingAlgorithm implements RateLimiter{
-    Map<String, TokenBucket> tokenBuckets;
+// ---------- Token Bucket ----------
 
-    @Override
-    public boolean isAllowed(String userId) {
-        TokenBucket userTB = tokenBuckets.get(userId);
+// One bucket per user. All mutable state is only ever touched under the
+// bucket's own monitor, so refill + consume happen as one atomic step.
+class TokenBucket {
+    private final int capacity;
+    private final double refillTokensPerSecond;
+    private double tokens;
+    private long lastRefillTimeMillis;
 
-        if(userTB.checkIfAllowed()){
-            return true;
-        }else{
-            return false;
+    public TokenBucket(int capacity, double refillTokensPerSecond) {
+        this.capacity = capacity;
+        this.refillTokensPerSecond = refillTokensPerSecond;
+        this.tokens = capacity;
+        this.lastRefillTimeMillis = System.currentTimeMillis();
+    }
+
+    private void refill() {
+        long now = System.currentTimeMillis();
+        double elapsedSeconds = (now - lastRefillTimeMillis) / 1000.0;
+        double eligibleTokens = elapsedSeconds * refillTokensPerSecond;
+        if (eligibleTokens > 0) {
+            tokens = Math.min(capacity, tokens + eligibleTokens);
+            lastRefillTimeMillis = now;
         }
     }
-}
 
-class TokenBucket{
-    int capacity;
-    int tokens;
-    long lastRefillTime;
-    float refillRate;    // 1 token /3600
-
-    public TokenBucket(){
-
-    }
-    private void refill(){
-        long currentTime = System.currentTimeMillis();
-        long diff = (currentTime - lastRefillTime)/1000;
-        int eligibleToken =  (int)(diff * refillRate);
-        tokens = Math.min(capacity, tokens + eligibleToken);
-
-        lastRefillTime = System.currentTimeMillis();
-    }
-    boolean checkIfAllowed(){
+    public synchronized boolean tryConsume() {
         refill();
-        if(tokens >= 1){
-            tokens--;
+        if (tokens >= 1.0) {
+            tokens -= 1.0;
             return true;
-        }else{
-            return false;
         }
+        return false;
     }
 }
 
-// Q : Removing from front, inserting at the end....
-class SlidingWindowStrategy implements RateLimiter{
-    Map<String, SlidingWindow> tokenBuckets;
+// Per-user buckets are created lazily and exactly once via computeIfAbsent,
+// which is atomic on ConcurrentHashMap -- no explicit locking needed here.
+class TokenBucketRateLimiter implements RateLimiter {
+    private final Map<String, TokenBucket> buckets = new ConcurrentHashMap<>();
+    private final int capacity;
+    private final double refillTokensPerSecond;
+
+    public TokenBucketRateLimiter(int capacity, double refillTokensPerSecond) {
+        this.capacity = capacity;
+        this.refillTokensPerSecond = refillTokensPerSecond;
+    }
+
     @Override
     public boolean isAllowed(String userId) {
-        
+        TokenBucket bucket = buckets.computeIfAbsent(
+                userId, id -> new TokenBucket(capacity, refillTokensPerSecond));
+        return bucket.tryConsume();
     }
 }
 
-//Per User Sliding Windows
-class SlidingWindow{
-    Deque<Long> queue = new LinkedList<>();
-    long windowSize = 60*1000; // 60 seconds 
-    int maximum_request_allowed_in_window = 5;
-    
+// ---------- Sliding Window ----------
 
-    boolean isAllowed(){
-        Long currentTime = System.currentTimeMillis()/1000;
-        if(queue.size() < maximum_request_allowed_in_window)    //10
-        {
-            queue.offer(currentTime);
-        }else{
-                    //10 AM        2 Hr 
-            while(currentTime - windowSize > queue.peek()){
-                queue.remove();
-            }
-            if(queue.size() < maximum_request_allowed_in_window)
-                queue.offer(currentTime);
-            else{
-                return false;
-            }
+// One window per user. The deque of request timestamps is only mutated
+// under the window's own monitor.
+class SlidingWindow {
+    private final Deque<Long> timestamps = new ArrayDeque<>();
+    private final long windowSizeMillis;
+    private final int maxRequestsPerWindow;
+
+    public SlidingWindow(long windowSizeMillis, int maxRequestsPerWindow) {
+        this.windowSizeMillis = windowSizeMillis;
+        this.maxRequestsPerWindow = maxRequestsPerWindow;
+    }
+
+    public synchronized boolean isAllowed() {
+        long now = System.currentTimeMillis();
+        while (!timestamps.isEmpty() && now - timestamps.peekFirst() > windowSizeMillis) {
+            timestamps.pollFirst();
         }
-        return true;
+        if (timestamps.size() < maxRequestsPerWindow) {
+            timestamps.offerLast(now);
+            return true;
+        }
+        return false;
     }
 }
+
+class SlidingWindowRateLimiter implements RateLimiter {
+    private final Map<String, SlidingWindow> windows = new ConcurrentHashMap<>();
+    private final long windowSizeMillis;
+    private final int maxRequestsPerWindow;
+
+    public SlidingWindowRateLimiter(long windowSizeMillis, int maxRequestsPerWindow) {
+        this.windowSizeMillis = windowSizeMillis;
+        this.maxRequestsPerWindow = maxRequestsPerWindow;
+    }
+
+    @Override
+    public boolean isAllowed(String userId) {
+        SlidingWindow window = windows.computeIfAbsent(
+                userId, id -> new SlidingWindow(windowSizeMillis, maxRequestsPerWindow));
+        return window.isAllowed();
+    }
+}
+
+// ---------- Factory (Factory pattern: pick an algorithm without callers knowing the class) ----------
+
+enum RateLimiterType {
+    TOKEN_BUCKET, SLIDING_WINDOW
+}
+
+class RateLimiterFactory {
+    public static RateLimiter create(RateLimiterType type, int limit, long windowOrRefillMillis) {
+        switch (type) {
+            case TOKEN_BUCKET:
+                double refillPerSecond = limit / (windowOrRefillMillis / 1000.0);
+                return new TokenBucketRateLimiter(limit, refillPerSecond);
+            case SLIDING_WINDOW:
+                return new SlidingWindowRateLimiter(windowOrRefillMillis, limit);
+            default:
+                throw new IllegalArgumentException("Unsupported rate limiter type: " + type);
+        }
+    }
+}
+
+// ---------- Demo / Simulation ----------
 
 public class RateLimiterDemo {
-    
+
+    public static void main(String[] args) throws InterruptedException {
+        // 5 requests allowed per 1-second window, refilling continuously.
+        RateLimiter rateLimiter = RateLimiterFactory.create(RateLimiterType.TOKEN_BUCKET, 5, 1000);
+
+        int threadCount = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+        AtomicInteger allowed = new AtomicInteger();
+        AtomicInteger rejected = new AtomicInteger();
+
+        String userId = "user-1";
+        System.out.println("Firing " + threadCount + " concurrent requests for " + userId
+                + " against a token bucket of capacity 5...");
+
+        for (int i = 0; i < threadCount; i++) {
+            executor.submit(() -> {
+                try {
+                    if (rateLimiter.isAllowed(userId)) {
+                        allowed.incrementAndGet();
+                    } else {
+                        rejected.incrementAndGet();
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await();
+        executor.shutdown();
+
+        System.out.println("Allowed: " + allowed.get() + ", Rejected: " + rejected.get());
+
+        System.out.println("\nSliding window demo (max 3 requests / 1000ms):");
+        RateLimiter slidingWindowLimiter =
+                RateLimiterFactory.create(RateLimiterType.SLIDING_WINDOW, 3, 1000);
+        for (int i = 1; i <= 5; i++) {
+            System.out.println("Request " + i + " allowed = " + slidingWindowLimiter.isAllowed("user-2"));
+        }
+    }
 }

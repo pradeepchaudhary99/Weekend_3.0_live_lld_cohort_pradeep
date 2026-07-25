@@ -1,4 +1,4 @@
-package DesignPattern.CreationalDesignPattern;
+package CreationalDesignPattern;
 
 import java.rmi.NotBoundException;
 import java.util.HashMap;
